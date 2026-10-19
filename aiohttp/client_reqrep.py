@@ -997,6 +997,10 @@ class ClientRequestBase:
     _upload_tracker: UploadTracker | None = None
     _upload_gen = 0
 
+    # Connector-side connection pin this request participates in, set by
+    # ClientSession when the request is issued inside a pin_connection() scope.
+    _pin: Any = None
+
     _skip_auto_headers: "CIMultiDict[None] | None" = None
 
     # N.B.

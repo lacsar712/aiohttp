@@ -513,8 +513,58 @@ The example limits amount of parallel connections to the same to `30`.
 
 The default is `0` (no limit on per host bases).
 
+.. _aiohttp-client-pin-connection:
+
+Pinning requests to one connection
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Occasionally a series of requests must be served by the *same* TCP
+connection -- limiting the pool size to one is only an approximation,
+because a dead keep-alive connection is silently replaced and unrelated
+requests may borrow the connection. :py:meth:`aiohttp.ClientSession.pin_connection`
+opens an explicit scope that *pins* requests to the exact connection
+acquired by the first request in the scope::
+
+    async with session.pin_connection() as pin:
+        async with await session.get("http://example.com/step1") as resp:
+            await resp.read()
+        # served by the very same connection
+        async with await session.get("http://example.com/step2") as resp:
+            await resp.read()
+
+The scope starts unbound; the first request binds it to both the
+connection it actually gets and that request's connection key (host,
+port, proxy, proxy headers and SSL settings). Every later request in
+the scope with the same connection key reuses that connection; the
+pinned connection is never returned to the shared pool while the scope
+is open, so requests outside the scope cannot borrow it. Requests with
+another connection key still use the regular pool and never affect the
+pin. Redirects stay on the pinned connection as long as they keep the
+same connection key, while a redirect to another origin uses the pool
+without changing the pin target.
+
+If a previous response is still in progress, the next same-key request
+in the scope waits for the pinned connection to be released instead of
+opening a second one; the wait is bounded by that request's connection
+and total timeouts and cancelling the request leaves no connection slot
+held. Scopes can be nested: an inner scope whose first request matches
+an enclosing pin joins the enclosing connection, and leaving the inner
+scope leaves the enclosing pin intact. Two scopes opened concurrently
+are independent and never exchange connections.
+
+A pinned connection is never replaced. When it is closed by the peer,
+marked ``Connection: close``, or taken out of the pool (a successful
+:py:meth:`~aiohttp.ClientSession.ws_connect` upgrade does that), later
+same-key requests in the scope fail with
+:class:`aiohttp.ClientConnectionPinError` and mention the failing
+connection key. Because the connector cannot reuse connections when
+``force_close=True``, the second request in a scope fails the same way
+with such a connector. When the scope exits with the connection idle it
+returns to the regular pool under the normal keep-alive rules, and
+closing the session closes it as usual.
+
 Tuning the DNS cache
-^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^
 
 By default :class:`~aiohttp.TCPConnector` comes with the DNS cache
 table enabled, and resolutions will be cached by default for `10` seconds.

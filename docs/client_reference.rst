@@ -877,6 +877,27 @@ The client session supports the context manager protocol for self closing.
          .. versionadded:: 3.14
 
 
+   .. method:: pin_connection()
+
+      Open a connection-pin scope as an asynchronous context manager::
+
+          async with session.pin_connection() as pin:
+              ...
+
+      The first request in the scope pins the exact connection it
+      acquires, together with its connection key; subsequent requests
+      with the same key reuse that connection, waiting for it when it is
+      busy. Requests with another key and requests outside the scope
+      keep using the regular connection pool. If the pinned connection
+      cannot be reused anymore, later matching requests in the scope
+      raise :class:`aiohttp.ClientConnectionPinError`.
+
+      Returns a :class:`~aiohttp.ConnectionPin` instance, usable as an
+      asynchronous context manager. Scopes may be nested; concurrent
+      scopes are isolated.
+
+      .. versionadded:: 4.0
+
    .. method:: close()
       :async:
 
@@ -2437,6 +2458,35 @@ Utilities
    .. versionadded:: 3.14.4
 
 
+.. class:: ConnectionPin()
+   :canonical: aiohttp.client.ConnectionPin
+
+   An open connection-pin scope returned by
+   :py:meth:`ClientSession.pin_connection`. Instances are asynchronous
+   context managers and must not be instantiated directly.
+
+   See :ref:`aiohttp-client-pin-connection` for a full description of
+   the semantics.
+
+   .. attribute:: key
+
+      The :class:`aiohttp.ClientRequest` connection key the scope is
+      pinned to, or ``None`` until the first request of the scope has
+      acquired a connection. The key identifies host, port, proxy and
+      SSL settings.
+
+      A read-only property.
+
+   .. attribute:: bound
+
+      ``True`` once the opening request has pinned a connection,
+      ``False`` while the scope is still unbound.
+
+      A read-only property.
+
+   .. versionadded:: 4.0
+
+
 .. class:: DigestAuthMiddleware(login, password, *, preemptive=True)
    :canonical: aiohttp.client_middleware_digest_auth.DigestAuthMiddleware
 
@@ -2983,6 +3033,16 @@ Connection errors
 
    Derived from :exc:`ClientError`
 
+.. class:: ClientConnectionPinError
+   :canonical: aiohttp.client_exceptions.ClientConnectionPinError
+
+   The connection pinned by a :py:meth:`ClientSession.pin_connection`
+   scope is no longer usable (it was closed or taken over, for example
+   by a WebSocket upgrade). A new connection is never established to
+   replace a pinned one.
+
+   Derived from :exc:`ClientConnectionError`
+
 .. class:: ClientConnectionResetError
    :canonical: aiohttp.client_exceptions.ClientConnectionResetError
 
@@ -3099,6 +3159,8 @@ Hierarchy of exceptions
 * :exc:`ClientError`
 
   * :exc:`ClientConnectionError`
+
+    * :exc:`ClientConnectionPinError`
 
     * :exc:`ClientConnectionResetError`
 

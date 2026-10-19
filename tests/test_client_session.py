@@ -25,7 +25,13 @@ from aiohttp import abc, client, hdrs, tracing, web
 from aiohttp.client import ClientSession
 from aiohttp.client_proto import ResponseHandler
 from aiohttp.client_reqrep import ClientRequest, ClientTimeout, ConnectionKey
-from aiohttp.connector import BaseConnector, Connection, TCPConnector, UnixConnector
+from aiohttp.connector import (
+    BaseConnector,
+    Connection,
+    TCPConnector,
+    UnixConnector,
+    _ConnectionPin,
+)
 from aiohttp.cookiejar import CookieJar
 from aiohttp.http import RawResponseMessage
 from aiohttp.payload import Payload
@@ -608,9 +614,13 @@ async def test_close_conn_on_error(
     original_connect = session._connector.connect
 
     async def connect(
-        req: ClientRequest, traces: list[Trace], timeout: aiohttp.ClientTimeout
+        req: ClientRequest,
+        traces: list[Trace],
+        timeout: aiohttp.ClientTimeout,
+        *,
+        pin: _ConnectionPin | None = None,
     ) -> Connection:
-        conn = await original_connect(req, traces, timeout)
+        conn = await original_connect(req, traces, timeout, pin=pin)
         connections.append(conn)
         return conn
 
@@ -673,9 +683,13 @@ async def test_ws_connect_allowed_protocols(  # type: ignore[misc]
     original_connect = session._connector.connect
 
     async def connect(
-        req: ClientRequest, traces: list[Trace], timeout: aiohttp.ClientTimeout
+        req: ClientRequest,
+        traces: list[Trace],
+        timeout: aiohttp.ClientTimeout,
+        *,
+        pin: _ConnectionPin | None = None,
     ) -> Connection:
-        conn = await original_connect(req, traces, timeout)
+        conn = await original_connect(req, traces, timeout, pin=pin)
         connections.append(conn)
         return conn
 
@@ -738,9 +752,13 @@ async def test_ws_connect_unix_socket_allowed_protocols(  # type: ignore[misc]
     original_connect = session._connector.connect
 
     async def connect(
-        req: ClientRequest, traces: list[Trace], timeout: aiohttp.ClientTimeout
+        req: ClientRequest,
+        traces: list[Trace],
+        timeout: aiohttp.ClientTimeout,
+        *,
+        pin: _ConnectionPin | None = None,
     ) -> Connection:
-        conn = await original_connect(req, traces, timeout)
+        conn = await original_connect(req, traces, timeout, pin=pin)
         connections.append(conn)
         return conn
 

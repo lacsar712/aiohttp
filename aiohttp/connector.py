@@ -23,6 +23,7 @@ from . import hdrs, helpers
 from .abc import AbstractResolver, ResolveResult
 from .client_exceptions import (
     ClientConnectionError,
+    ClientConnectionPinError,
     ClientConnectorCertificateError,
     ClientConnectorDNSError,
     ClientConnectorError,
@@ -302,6 +303,104 @@ class _TransportPlaceholder:
         """Abort the placeholder (does nothing)."""
 
 
+class _ConnectionPin:
+    """Connector-side state of a ClientSession connection-pin scope.
+
+    A pin starts unbound: the first request made through the scope binds
+    it to the connection key and protocol of the connection that request
+    actually acquires. From then on, requests matching the key must be
+    served by ``proto``; the protocol is parked on the pin instead of the
+    regular pool whenever it is released.
+
+    Pins form a parent chain mirroring nested scopes: an unbound inner
+    pin whose enclosing pin already owns the requested key binds to the
+    enclosing pin's protocol instead of acquiring another connection.
+    """
+
+    __slots__ = (
+        "_loop",
+        "parent",
+        "key",
+        "proto",
+        "closed",
+        "invalid",
+        "_exc",
+        "_wake_fut",
+    )
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        parent: "_ConnectionPin | None",
+    ) -> None:
+        self._loop = loop
+        self.parent = parent
+        self.key: "ConnectionKey | None" = None
+        self.proto: ResponseHandler | None = None
+        # Set by unpin() when the scope is exited; never acquires or binds.
+        self.closed = False
+        # Set once the pinned connection can no longer be used. A failed
+        # pin is never repaired by establishing a new connection.
+        self.invalid = False
+        self._exc: BaseException | None = None
+        # Completed whenever something changes that a queued request may be
+        # waiting for: the protocol was parked idle, the pin failed, or the
+        # scope exited.
+        self._wake_fut: asyncio.Future[None] = loop.create_future()
+
+    def enclosing(self, key: "ConnectionKey") -> "_ConnectionPin | None":
+        """Return the nearest still-live enclosing pin bound to ``key``."""
+        pin = self.parent
+        while pin is not None:
+            if pin.key == key and not pin.closed and not pin.invalid:
+                return pin
+            pin = pin.parent
+        return None
+
+    def waiter(self) -> asyncio.Future[None]:
+        """Return a future to await for the next state change."""
+        fut = self._wake_fut
+        if fut.done():
+            fut = self._wake_fut = self._loop.create_future()
+        return fut
+
+    def wake(self) -> None:
+        if not self._wake_fut.done():
+            self._wake_fut.set_result(None)
+
+    def fail(self, exc: BaseException) -> None:
+        """Mark the pin invalid and wake every queued request."""
+        self.invalid = True
+        if self._exc is None:
+            self._exc = exc
+        self.wake()
+
+    def cancel(self) -> None:
+        """Wake queued requests when the connector is closing.
+
+        A done wake future cannot be cancelled, so queued requests are
+        woken normally and discover the closed connector themselves.
+        """
+        self.closed = True
+        self.wake()
+
+    def __repr__(self) -> str:
+        state = "unbound" if self.key is None else f"key={self.key}"
+        if self.invalid:
+            state += ", invalid"
+        if self.closed:
+            state += ", closed"
+        return f"<_ConnectionPin({state})>"
+
+
+def _pinned_connection_closed_error(key: "ConnectionKey") -> ClientConnectionPinError:
+    return ClientConnectionPinError(
+        f"Cannot reuse the pinned connection for {key}: "
+        "the connection was closed; a pinned connection is never replaced "
+        "with a newly established one"
+    )
+
+
 class BaseConnector:
     """Base connector class.
 
@@ -378,6 +477,17 @@ class BaseConnector:
         self._waiters: defaultdict[
             ConnectionKey, OrderedDict[asyncio.Future[None], None]
         ] = defaultdict(OrderedDict)
+
+        # Connection pins created by ClientSession.pin_connection() scopes.
+        # All currently open (including invalidated-but-not-yet-exited) pins.
+        self._pins: set[_ConnectionPin] = set()
+        # A protocol kept by a pin never enters ``_conns``. Each pinned
+        # protocol maps to the pins referencing it (outer scopes first);
+        # nested scopes pin the very same protocol.
+        self._proto_pins: dict[ResponseHandler, list[_ConnectionPin]] = {}
+        # Protocols released while still pinned, parked for the pin's next
+        # request instead of being returned to the regular pool.
+        self._pinned_idle: dict[ResponseHandler, asyncio.Future[None]] = {}
 
         self._loop = loop
         self._factory = functools.partial(ResponseHandler, loop=loop)
@@ -573,6 +683,20 @@ class BaseConnector:
                     if closed := proto.closed:
                         waiters.append(closed)
 
+            # Idle connections parked by open connection-pin scopes are not
+            # in ``_conns`` or ``_acquired``; close them explicitly.
+            for proto in self._pinned_idle:
+                if (
+                    abort_ssl
+                    and proto.transport
+                    and proto.transport.get_extra_info("sslcontext") is not None
+                ):
+                    proto.abort()
+                else:
+                    proto.close()
+                if closed := proto.closed:
+                    waiters.append(closed)
+
             for proto in self._acquired:
                 if (
                     abort_ssl
@@ -599,6 +723,15 @@ class BaseConnector:
                 for keyed_waiter in keyed_waiters:
                     keyed_waiter.cancel()
             self._waiters.clear()
+            # Fail and interrupt all connection-pin scopes; their queued
+            # requests are cancelled the same way pool-slot waiters are.
+            closed_error = ClientConnectionError("Connector is closed.")
+            for pin in self._pins:
+                pin.fail(closed_error)
+                pin.cancel()
+            self._pins.clear()
+            self._proto_pins.clear()
+            self._pinned_idle.clear()
             self._cleanup_handle = None
             self._cleanup_closed_transports.clear()
             self._cleanup_closed_handle = None
@@ -660,11 +793,211 @@ class BaseConnector:
                 req.headers[hdrs.PROXY_AUTHORIZATION] = proxy_auth
         return proxy_req
 
+    def create_pin(self, parent: _ConnectionPin | None = None) -> _ConnectionPin:
+        """Create an unbound connection pin for a ClientSession pin scope."""
+        return _ConnectionPin(self._loop, parent)
+
+    def _bind_pin(
+        self, pin: _ConnectionPin, key: "ConnectionKey", proto: ResponseHandler
+    ) -> None:
+        """Bind an unbound pin to the connection its opening request got."""
+        assert pin.key is None and pin.proto is None
+        first = proto not in self._proto_pins
+        self._proto_pins.setdefault(proto, []).append(pin)
+        pin.key = key
+        pin.proto = proto
+        self._pins.add(pin)
+        if first:
+            # Wake queued pinned requests as soon as the peer goes away,
+            # even while the connection is merely parked idle.
+            closed_fut = proto.closed
+            if closed_fut is None:
+                # connection_lost() already ran before we could subscribe
+                self._pinned_proto_closed(proto, None)
+            else:
+                closed_fut.add_done_callback(
+                    functools.partial(self._pinned_proto_closed, proto)
+                )
+
+    def _pinned_proto_closed(
+        self,
+        proto: ResponseHandler,
+        closed_fut: "asyncio.Future[None] | None",
+    ) -> None:
+        """Invalidate pins referencing a protocol whose transport was lost."""
+        if proto not in self._proto_pins:
+            return
+        cause: BaseException | None = None
+        if closed_fut is not None and not closed_fut.cancelled():
+            cause = closed_fut.exception()
+        pins = self._proto_pins.get(proto)
+        key = pins[0].key if pins else None
+        if key is not None:
+            exc = _pinned_connection_closed_error(key)
+        else:
+            exc = ClientConnectionPinError("Pinned connection was closed")
+        if cause is not None:
+            exc.__cause__ = cause
+        self._invalidate_pin_proto(proto, exc)
+
+    def _invalidate_pin_proto(self, proto: ResponseHandler, exc: BaseException) -> None:
+        """Fail every pin referencing ``proto`` without closing it."""
+        pins = self._proto_pins.pop(proto, None)
+        self._pinned_idle.pop(proto, None)
+        if not pins:
+            return
+        for pin in pins:
+            self._pins.discard(pin)
+            pin.fail(exc)
+
+    def _exhaust_pin_proto(self, proto: ResponseHandler, message: str) -> None:
+        """Invalidate pins after ``proto`` left the pool (e.g. WS upgrade)."""
+        if proto in self._proto_pins:
+            self._invalidate_pin_proto(proto, ClientConnectionPinError(message))
+
+    def unpin(self, pin: _ConnectionPin) -> None:
+        """Close a pin scope without affecting enclosing scopes."""
+        pin.closed = True
+        pin.wake()
+        self._pins.discard(pin)
+        proto = pin.proto
+        if proto is None:
+            return
+        pins = self._proto_pins.get(proto)
+        if pins is None or pin not in pins:
+            return
+        pins.remove(pin)
+        if pins:
+            # An enclosing scope still owns the very same connection; it
+            # stays parked for that scope.
+            pins[0].wake()
+            return
+        self._proto_pins.pop(proto, None)
+        if self._pinned_idle.pop(proto, None) is None:
+            # The protocol is acquired by an in-flight response (or the
+            # connector is gone); its release now follows the regular path.
+            return
+        if self._closed:
+            return
+        key = pin.key
+        assert key is not None
+        # Last scope exited while the connection sat idle: hand it back to
+        # the regular pool, applying the same keepalive/close rules as any
+        # other released connection.
+        if proto.is_connected() and not (self._force_close or proto.should_close):
+            self._conns[key].append((proto, monotonic()))
+            if self._cleanup_handle is None:
+                self._cleanup_handle = helpers.weakref_handle(
+                    self,
+                    "_cleanup",
+                    self._keepalive_timeout,
+                    self._loop,
+                    timeout_ceil_threshold=self._timeout_ceil_threshold,
+                )
+        else:
+            transport = proto.transport
+            proto.close()
+            if key.is_ssl and not self._cleanup_closed_disabled:
+                self._cleanup_closed_transports.append(transport)
+
     async def connect(
-        self, req: ClientRequest, traces: list["Trace"], timeout: "ClientTimeout"
+        self,
+        req: ClientRequest,
+        traces: list["Trace"],
+        timeout: "ClientTimeout",
+        *,
+        pin: _ConnectionPin | None = None,
     ) -> Connection:
-        """Get from pool or create new connection."""
+        """Get from pool or create new connection.
+
+        When ``pin`` is given the request participates in a connection-pin
+        scope: an already bound pin forces reuse of its exact protocol for
+        the matching key, an unbound pin binds to the connection acquired
+        for this request, and other keys use the regular pool unchanged.
+        """
         key = req.connection_key
+        if pin is not None and not pin.closed:
+            if pin.key is not None:
+                if pin.key == key:
+                    if req.proxy:
+                        self._update_proxy_auth_header_and_build_proxy_req(req)
+                    return await self._connect_pinned(pin, key, traces, timeout)
+            elif (ancestor := pin.enclosing(key)) is not None:
+                if req.proxy:
+                    self._update_proxy_auth_header_and_build_proxy_req(req)
+                conn = await self._connect_pinned(ancestor, key, traces, timeout)
+                proto = conn.protocol
+                assert proto is not None
+                self._bind_pin(pin, key, proto)
+                return conn
+
+        conn = await self._connect_default(key, req, traces, timeout)
+
+        if pin is not None and not pin.closed and pin.key is None:
+            proto = conn.protocol
+            assert proto is not None
+            self._bind_pin(pin, key, proto)
+        return conn
+
+    async def _connect_pinned(
+        self,
+        pin: _ConnectionPin,
+        key: "ConnectionKey",
+        traces: list["Trace"],
+        timeout: "ClientTimeout",
+    ) -> Connection:
+        """Acquire the exact protocol owned by ``pin``, waiting if busy."""
+        async with ceil_timeout(timeout.connect, timeout.ceil_threshold):
+            while True:
+                if pin.invalid:
+                    assert pin._exc is not None
+                    raise pin._exc
+                if pin.closed or self._closed:
+                    raise ClientConnectionError("Connector is closed.")
+                proto = pin.proto
+                assert proto is not None
+
+                idle_fut = self._pinned_idle.get(proto)
+                if idle_fut is not None and idle_fut.done():
+                    if not proto.is_connected():
+                        self._invalidate_pin_proto(
+                            proto, _pinned_connection_closed_error(key)
+                        )
+                        continue
+                    # The pinned protocol is parked and free: reclaim it.
+                    self._pinned_idle.pop(proto, None)
+                    self._acquired.add(proto)
+                    if self._limit_per_host:
+                        self._acquired_per_host[key].add(proto)
+                    if traces:
+                        for trace in traces:
+                            try:
+                                await trace.send_connection_reuseconn()
+                            except BaseException:
+                                self._release_acquired(key, proto)
+                                raise
+                    return Connection(self, key, proto, self._loop)
+
+                # The pinned protocol is held by another in-flight request
+                # of this pin; wait for it without opening a second one.
+                # Limits are not consumed by this wait, so cancellation or
+                # timeout has no slot to restore.
+                if traces:
+                    for trace in traces:
+                        await trace.send_connection_queued_start()
+                await pin.waiter()
+                if traces:
+                    for trace in traces:
+                        await trace.send_connection_queued_end()
+
+    async def _connect_default(
+        self,
+        key: "ConnectionKey",
+        req: ClientRequest,
+        traces: list["Trace"],
+        timeout: "ClientTimeout",
+    ) -> Connection:
+        """Get a connection from the pool or create a new one."""
         if (conn := await self._get(key, traces)) is not None:
             # If we do not have to wait and we can get a connection from the pool
             # we can avoid the timeout ceil logic and directly return the connection
@@ -857,6 +1190,11 @@ class BaseConnector:
 
         self._release_acquired(key, protocol)
 
+        pins = self._proto_pins.get(protocol)
+        if pins is not None:
+            self._release_pinned_protocol(key, protocol, pins, should_close)
+            return
+
         if self._force_close or should_close or protocol.should_close:
             transport = protocol.transport
             protocol.close()
@@ -874,6 +1212,47 @@ class BaseConnector:
                 self._loop,
                 timeout_ceil_threshold=self._timeout_ceil_threshold,
             )
+
+    def _release_pinned_protocol(
+        self,
+        key: "ConnectionKey",
+        protocol: ResponseHandler,
+        pins: list[_ConnectionPin],
+        should_close: bool,
+    ) -> None:
+        """Release a protocol kept by one or more open pin scopes.
+
+        Reusable protocols are parked on the pins, never returned to the
+        shared pool, so neither unpinned requests nor other scopes can
+        take them. Unreusable protocols invalidate the pins instead.
+        """
+        if self._force_close or should_close or protocol.should_close:
+            transport = protocol.transport
+            protocol.close()
+            if key.is_ssl and not self._cleanup_closed_disabled:
+                self._cleanup_closed_transports.append(transport)
+            if self._force_close:
+                reason = "the connector does not allow connection reuse"
+            else:
+                reason = "the connection was marked for closure"
+            self._invalidate_pin_proto(
+                protocol,
+                ClientConnectionPinError(
+                    f"Cannot reuse the pinned connection for {key}: {reason}; "
+                    "a pinned connection is never replaced with a newly "
+                    "established one"
+                ),
+            )
+            return
+
+        fut = self._pinned_idle.get(protocol)
+        if fut is None:
+            fut = self._loop.create_future()
+            self._pinned_idle[protocol] = fut
+        if not fut.done():
+            fut.set_result(None)
+        for pin in pins:
+            pin.wake()
 
     async def _create_connection(
         self, req: ClientRequest, traces: list["Trace"], timeout: "ClientTimeout"

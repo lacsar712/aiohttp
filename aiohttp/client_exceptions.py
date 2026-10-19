@@ -22,6 +22,7 @@ else:
 __all__ = (
     "ClientError",
     "ClientConnectionError",
+    "ClientConnectionPinError",
     "ClientConnectionResetError",
     "ClientOSError",
     "ClientConnectorError",
@@ -124,6 +125,17 @@ class TooManyRedirects(ClientResponseError):
 
 class ClientConnectionError(ClientError):
     """Base class for client socket errors."""
+
+
+class ClientConnectionPinError(ClientConnectionError):
+    """Connection pinned by a connection-pin scope is no longer usable.
+
+    Raised when a request issued inside a :class:`aiohttp.ClientSession`
+    connection-pin scope needs the pinned connection but that connection
+    has been closed, was removed from the pool (for example by a WebSocket
+    upgrade) or the connector was closed. A new connection is never
+    established to replace a pinned one.
+    """
 
 
 class ClientConnectionResetError(ClientConnectionError, ConnectionResetError):

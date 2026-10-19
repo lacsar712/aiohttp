@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import contextvars
 import dataclasses
 import hashlib
 import json
@@ -39,6 +40,7 @@ from ._websocket.reader import WebSocketDataQueue
 from .abc import AbstractCookieJar
 from .client_exceptions import (
     ClientConnectionError,
+    ClientConnectionPinError,
     ClientConnectionResetError,
     ClientConnectorCertificateError,
     ClientConnectorDNSError,
@@ -113,6 +115,7 @@ from .typedefs import (
 __all__ = (
     # client_exceptions
     "ClientConnectionError",
+    "ClientConnectionPinError",
     "ClientConnectionResetError",
     "ClientConnectorCertificateError",
     "ClientConnectorDNSError",
@@ -156,6 +159,7 @@ __all__ = (
     "ClientWebSocketResponse",
     # client
     "ClientSession",
+    "ConnectionPin",
     "ClientTimeout",
     "ClientWSTimeout",
     "request",
@@ -165,6 +169,9 @@ __all__ = (
 
 if TYPE_CHECKING:
     from ssl import SSLContext
+
+    from .client_reqrep import ConnectionKey
+    from .connector import _ConnectionPin
 else:
     SSLContext = None
 
@@ -250,6 +257,14 @@ _RetType_co = TypeVar(
 _CharsetResolver = Callable[[ClientResponse, bytes], str]
 
 
+# Innermost currently open connection-pin scope for this async context.
+# Request coroutines copy the context when they are scheduled, so tasks
+# started inside a scope participate in it while other tasks do not.
+_current_connection_pin: contextvars.ContextVar["ConnectionPin | None"] = (
+    contextvars.ContextVar("aiohttp_connection_pin", default=None)
+)
+
+
 # Module-level (not a closure) so it has a stable identity for the
 # ``_cached_build_client_middlewares`` cache key.
 async def _connect_and_send_request(req: ClientRequest) -> ClientResponse:
@@ -258,7 +273,12 @@ async def _connect_and_send_request(req: ClientRequest) -> ClientResponse:
     if (tracker := req._upload_tracker) is not None:
         req._upload_gen = tracker._attempt_started()
     try:
-        conn = await connector.connect(req, traces=req._traces, timeout=req._timeout)
+        conn = await connector.connect(
+            req,
+            traces=req._traces,
+            timeout=req._timeout,
+            pin=req._pin,
+        )
     except asyncio.TimeoutError as exc:
         raise ConnectionTimeoutError(f"Connection timeout to host {req.url}") from exc
 
@@ -275,6 +295,74 @@ async def _connect_and_send_request(req: ClientRequest) -> ClientResponse:
         conn.close()
         raise
     return resp
+
+
+@final
+class ConnectionPin:
+    """An open connection-pin scope returned by :meth:`ClientSession.pin_connection`.
+
+    The scope starts unbound: the first request issued inside it pins the
+    exact connection that request actually acquires, together with that
+    request's connection key (host, port, proxy and TLS settings). Every
+    later request with the same key reuses that one connection; requests
+    for other connection keys keep using the regular connection pool and
+    never borrow the pinned connection.
+
+    Instances are created by :meth:`ClientSession.pin_connection` and are
+    meant to be used as asynchronous context managers; they must not be
+    instantiated directly.
+    """
+
+    __slots__ = ("_session", "_pin", "_parent", "_token")
+
+    def __init__(self, session: "ClientSession") -> None:
+        self._session = session
+        self._pin: _ConnectionPin | None = None
+        self._parent: ConnectionPin | None = None
+        self._token: contextvars.Token[ConnectionPin | None] | None = None
+
+    async def __aenter__(self) -> "ConnectionPin":
+        connector = self._session._connector
+        if connector is None or connector.closed:
+            raise RuntimeError("Session is closed")
+        self._parent = _current_connection_pin.get()
+        parent_pin = self._parent._pin if self._parent is not None else None
+        self._pin = connector.create_pin(parent_pin)
+        self._token = _current_connection_pin.set(self)
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        assert self._token is not None
+        _current_connection_pin.reset(self._token)
+        pin = self._pin
+        self._pin = None
+        connector = self._session._connector
+        if connector is not None and pin is not None:
+            connector.unpin(pin)
+
+    @property
+    def key(self) -> "ConnectionKey | None":
+        """Connection key this scope is pinned to.
+
+        ``None`` until the first request of the scope has acquired a
+        connection.
+        """
+        if self._pin is None:
+            return None
+        return self._pin.key
+
+    @property
+    def bound(self) -> bool:
+        """Whether the scope is already pinned to a connection."""
+        return self._pin is not None and self._pin.key is not None
+
+    def __repr__(self) -> str:
+        return f"<ConnectionPin key={self.key!r}>"
 
 
 @final
@@ -565,6 +653,11 @@ class ClientSession:
             version = self._version
             params = params or {}
 
+            pin_scope = _current_connection_pin.get()
+            connector_pin: _ConnectionPin | None = (
+                pin_scope._pin if pin_scope is not None else None
+            )
+
             # Merge with default headers and transform to CIMultiDict
             headers = self._prepare_headers(headers)
 
@@ -746,6 +839,7 @@ class ClientSession:
                         traces=traces,
                         trust_env=self.trust_env,
                     )
+                    req._pin = connector_pin
                     req._upload_tracker = upload_tracker
 
                     # Apply middleware (if any) - per-request middleware overrides session middleware
@@ -1225,6 +1319,16 @@ class ClientSession:
             conn_proto = conn.protocol
             assert conn_proto is not None
 
+            # A successful WebSocket upgrade takes the connection out of
+            # the pool: any connection-pin scope covering this request is
+            # exhausted, its later requests fail instead of redialing.
+            assert self._connector is not None
+            self._connector._exhaust_pin_proto(
+                conn_proto,
+                "Pinned connection was upgraded to a WebSocket and taken "
+                "out of the connection pool",
+            )
+
             # For WS connection the read_timeout must be either ws_timeout.ws_receive or greater
             # None == no timeout, i.e. infinite timeout, so None is the max timeout possible
             if ws_timeout.ws_receive is None:
@@ -1405,6 +1509,34 @@ class ClientSession:
             return _RequestContextManager(
                 self._request(hdrs.METH_DELETE, url, **kwargs)
             )
+
+    def pin_connection(self) -> ConnectionPin:
+        """Open a scope that pins requests to one connection.
+
+        The first request made inside the scope pins the exact connection
+        it acquires; subsequent requests in the scope use the same
+        connection whenever they have the same connection key
+        (host, port, proxy and SSL settings). Requests with another
+        connection key still go through the regular pool, and the pinned
+        connection is never handed out for them.
+
+        Use as an asynchronous context manager::
+
+            async with session.pin_connection() as pin:
+                async with await session.get(url) as resp:
+                    await resp.read()
+                async with await session.get(url) as resp:
+                    # served by the very same TCP connection
+                    await resp.read()
+
+        Scopes can be nested; closing an inner scope leaves enclosing
+        scopes intact. If the pinned connection breaks or is taken over
+        (for example by a WebSocket upgrade), later matching requests in
+        the scope fail with
+        :class:`~aiohttp.ClientConnectionPinError` instead of opening a
+        replacement connection.
+        """
+        return ConnectionPin(self)
 
     async def close(self) -> None:
         """Close underlying connector.
