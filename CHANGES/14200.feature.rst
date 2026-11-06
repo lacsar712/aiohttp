@@ -1,0 +1,10 @@
+Added a task-local outbound egress profile stack
+(:class:`aiohttp.EgressProfile` / :func:`aiohttp.egress_profile`) with four
+independent dimensions: ``redirect_surface`` (keep/deny/cap one hop),
+``cookie_surface`` (freeze jar writes/omit outbound jar cookies),
+``timeout_overlay`` (fail-fast with a shorter frame timeout/freeze to the
+session baseline) and ``connector_admit`` (reject connection borrowing/force
+detach on release). The stack is bound to the running asyncio task, requires
+no new ``ClientSession``/connector/cookie jar constructor parameters, and is
+enforced by ``ClientSession._request``, websocket handshakes and all
+built-in connectors.

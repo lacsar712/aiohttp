@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import contextvars
 import dataclasses
 import hashlib
 import json
@@ -28,6 +27,7 @@ from typing import (
     Literal,
     TypedDict,
     TypeVar,
+    Unpack,
     final,
     overload,
 )
@@ -35,17 +35,17 @@ from typing import (
 from multidict import CIMultiDict, MultiDict, MultiDictProxy, istr
 from yarl import URL, Query
 
-from . import hdrs, http, payload
+from . import egress, hdrs, http, payload
 from ._websocket.reader import WebSocketDataQueue
 from .abc import AbstractCookieJar
 from .client_exceptions import (
     ClientConnectionError,
-    ClientConnectionPinError,
     ClientConnectionResetError,
     ClientConnectorCertificateError,
     ClientConnectorDNSError,
     ClientConnectorError,
     ClientConnectorSSLError,
+    ClientEgressError,
     ClientError,
     ClientHttpProxyError,
     ClientOSError,
@@ -55,6 +55,9 @@ from .client_exceptions import (
     ClientSSLError,
     ConnectionTimeoutError,
     ContentTypeError,
+    EgressAcquireDenied,
+    EgressRedirectCapExceeded,
+    EgressRedirectDenied,
     InvalidURL,
     InvalidUrlClientError,
     InvalidUrlRedirectClientError,
@@ -115,13 +118,13 @@ from .typedefs import (
 __all__ = (
     # client_exceptions
     "ClientConnectionError",
-    "ClientConnectionPinError",
     "ClientConnectionResetError",
     "ClientConnectorCertificateError",
     "ClientConnectorDNSError",
     "ClientConnectorError",
     "ClientConnectorSSLError",
     "ClientError",
+    "ClientEgressError",
     "ClientHttpProxyError",
     "ClientOSError",
     "ClientPayloadError",
@@ -130,6 +133,9 @@ __all__ = (
     "ClientSSLError",
     "ConnectionTimeoutError",
     "ContentTypeError",
+    "EgressAcquireDenied",
+    "EgressRedirectCapExceeded",
+    "EgressRedirectDenied",
     "InvalidURL",
     "InvalidUrlClientError",
     "RedirectClientError",
@@ -159,7 +165,6 @@ __all__ = (
     "ClientWebSocketResponse",
     # client
     "ClientSession",
-    "ConnectionPin",
     "ClientTimeout",
     "ClientWSTimeout",
     "request",
@@ -169,15 +174,8 @@ __all__ = (
 
 if TYPE_CHECKING:
     from ssl import SSLContext
-
-    from .client_reqrep import ConnectionKey
-    from .connector import _ConnectionPin
 else:
     SSLContext = None
-
-if sys.version_info >= (3, 11) and TYPE_CHECKING:
-    from typing import Unpack
-
 
 # URL parsers strip leading and trailing C0 control characters and spaces and
 # drop tabs and newlines before splitting a URL.
@@ -257,12 +255,34 @@ _RetType_co = TypeVar(
 _CharsetResolver = Callable[[ClientResponse, bytes], str]
 
 
-# Innermost currently open connection-pin scope for this async context.
-# Request coroutines copy the context when they are scheduled, so tasks
-# started inside a scope participate in it while other tasks do not.
-_current_connection_pin: contextvars.ContextVar["ConnectionPin | None"] = (
-    contextvars.ContextVar("aiohttp_connection_pin", default=None)
-)
+class _SessionOptions(TypedDict, total=False):
+    base_url: StrOrURL | None
+    connector: BaseConnector | None
+    cookies: LooseCookies | None
+    headers: LooseHeaders | None
+    proxy: StrOrURL | None
+    ssl: SSLContext | bool | Fingerprint
+    skip_auto_headers: Iterable[str] | None
+    json_serialize: JSONEncoder
+    json_serialize_bytes: JSONBytesEncoder | None
+    request_class: type[ClientRequest]
+    response_class: type[ClientResponse]
+    ws_response_class: type[ClientWebSocketResponse]
+    version: HttpVersion
+    connector_owner: bool
+    raise_for_status: bool | Callable[[ClientResponse], Awaitable[None]]
+    timeout: "_SENTINEL | ClientTimeout | None"
+    auto_decompress: bool
+    trust_env: bool
+    requote_redirect_url: bool
+    trace_configs: list[TraceConfig[object]] | None
+    read_bufsize: int
+    max_line_size: int
+    max_field_size: int
+    max_headers: int
+    fallback_charset_resolver: _CharsetResolver
+    middlewares: Sequence[ClientMiddlewareType]
+    ssl_shutdown_timeout: _SENTINEL | None | float
 
 
 # Module-level (not a closure) so it has a stable identity for the
@@ -273,13 +293,8 @@ async def _connect_and_send_request(req: ClientRequest) -> ClientResponse:
     if (tracker := req._upload_tracker) is not None:
         req._upload_gen = tracker._attempt_started()
     try:
-        conn = await connector.connect(
-            req,
-            traces=req._traces,
-            timeout=req._timeout,
-            pin=req._pin,
-        )
-    except asyncio.TimeoutError as exc:
+        conn = await connector.connect(req, traces=req._traces, timeout=req._timeout)
+    except TimeoutError as exc:
         raise ConnectionTimeoutError(f"Connection timeout to host {req.url}") from exc
 
     assert conn.protocol is not None
@@ -295,74 +310,6 @@ async def _connect_and_send_request(req: ClientRequest) -> ClientResponse:
         conn.close()
         raise
     return resp
-
-
-@final
-class ConnectionPin:
-    """An open connection-pin scope returned by :meth:`ClientSession.pin_connection`.
-
-    The scope starts unbound: the first request issued inside it pins the
-    exact connection that request actually acquires, together with that
-    request's connection key (host, port, proxy and TLS settings). Every
-    later request with the same key reuses that one connection; requests
-    for other connection keys keep using the regular connection pool and
-    never borrow the pinned connection.
-
-    Instances are created by :meth:`ClientSession.pin_connection` and are
-    meant to be used as asynchronous context managers; they must not be
-    instantiated directly.
-    """
-
-    __slots__ = ("_session", "_pin", "_parent", "_token")
-
-    def __init__(self, session: "ClientSession") -> None:
-        self._session = session
-        self._pin: _ConnectionPin | None = None
-        self._parent: ConnectionPin | None = None
-        self._token: contextvars.Token[ConnectionPin | None] | None = None
-
-    async def __aenter__(self) -> "ConnectionPin":
-        connector = self._session._connector
-        if connector is None or connector.closed:
-            raise RuntimeError("Session is closed")
-        self._parent = _current_connection_pin.get()
-        parent_pin = self._parent._pin if self._parent is not None else None
-        self._pin = connector.create_pin(parent_pin)
-        self._token = _current_connection_pin.set(self)
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: TracebackType | None,
-    ) -> None:
-        assert self._token is not None
-        _current_connection_pin.reset(self._token)
-        pin = self._pin
-        self._pin = None
-        connector = self._session._connector
-        if connector is not None and pin is not None:
-            connector.unpin(pin)
-
-    @property
-    def key(self) -> "ConnectionKey | None":
-        """Connection key this scope is pinned to.
-
-        ``None`` until the first request of the scope has acquired a
-        connection.
-        """
-        if self._pin is None:
-            return None
-        return self._pin.key
-
-    @property
-    def bound(self) -> bool:
-        """Whether the scope is already pinned to a connection."""
-        return self._pin is not None and self._pin.key is not None
-
-    def __repr__(self) -> str:
-        return f"<ConnectionPin key={self.key!r}>"
 
 
 @final
@@ -550,7 +497,7 @@ class ClientSession:
                 context["source_traceback"] = self._source_traceback
             self._loop.call_exception_handler(context)
 
-    if sys.version_info >= (3, 11) and TYPE_CHECKING:
+    if TYPE_CHECKING:
 
         def request(
             self,
@@ -606,6 +553,7 @@ class ClientSession:
         max_headers: int | None = None,
         middlewares: Sequence[ClientMiddlewareType] | None = None,
         upload_tracker: UploadTracker | None = None,
+        _egress_ignore_redirect_surface: bool = False,
     ) -> ClientResponse:
         # NOTE: timeout clamps existing connect and read timeouts.  We cannot
         # set the default to None because we need to detect if the user wants
@@ -653,11 +601,6 @@ class ClientSession:
             version = self._version
             params = params or {}
 
-            pin_scope = _current_connection_pin.get()
-            connector_pin: _ConnectionPin | None = (
-                pin_scope._pin if pin_scope is not None else None
-            )
-
             # Merge with default headers and transform to CIMultiDict
             headers = self._prepare_headers(headers)
 
@@ -693,9 +636,7 @@ class ClientSession:
                 except ValueError as e:
                     raise InvalidURL(proxy) from e
 
-            real_timeout = (
-                self._timeout if timeout is sentinel or timeout is None else timeout
-            )
+            real_timeout = egress.resolve_request_timeout(timeout, self._timeout)
             # timeout is cumulative for all request operations
             # (request, redirects, responses, data consuming)
             tm = TimeoutHandle(
@@ -773,6 +714,10 @@ class ClientSession:
                             headers[hdrs.AUTHORIZATION] = netrc_auth
 
                     all_cookies = self._cookie_jar.filter_cookies(url)
+                    if egress.outbound_cookies_omitted():
+                        # The frame only suppresses jar-resident cookies;
+                        # explicit per-request cookies are still sent below.
+                        all_cookies.clear()
 
                     if cookies is not None:
                         tmp_cookie_jar = _UnlimitedCookieJar(
@@ -839,7 +784,6 @@ class ClientSession:
                         traces=traces,
                         trust_env=self.trust_env,
                     )
-                    req._pin = connector_pin
                     req._upload_tracker = upload_tracker
 
                     # Apply middleware (if any) - per-request middleware overrides session middleware
@@ -884,8 +828,11 @@ class ClientSession:
                             raise
                         raise ClientOSError(*exc.args) from exc
 
-                    # Update cookies from raw headers to preserve duplicates
-                    if resp._raw_cookie_headers:
+                    # Update cookies from raw headers to preserve duplicates.
+                    # The stack is consulted per hop: a frame pushed while the
+                    # request is in flight is honored on subsequent hops
+                    # instead of an entry-time snapshot.
+                    if resp._raw_cookie_headers and not egress.jar_is_frozen():
                         self._cookie_jar.update_cookies_from_headers(
                             resp._raw_cookie_headers, resp.url
                         )
@@ -899,6 +846,22 @@ class ClientSession:
 
                         redirects += 1
                         history.append(resp)
+                        # The egress redirect surface is enforced per hop and
+                        # re-read from the task stack here (after the redirect
+                        # trace signal), never by mutating max_redirects or
+                        # snapshotting the profile at request entry.
+                        try:
+                            egress.guard_redirect_follow(
+                                redirects,
+                                ignore_redirect_surface=(
+                                    _egress_ignore_redirect_surface
+                                ),
+                            )
+                        except ClientEgressError:
+                            if req._body is not None:
+                                await req._body.close()
+                            resp.close()
+                            raise
                         if max_redirects and redirects >= max_redirects:
                             if req._body is not None:
                                 await req._body.close()
@@ -1047,7 +1010,7 @@ class ClientSession:
                 )
             raise
 
-    if sys.version_info >= (3, 11) and TYPE_CHECKING:
+    if TYPE_CHECKING:
 
         @overload
         def ws_connect(
@@ -1122,7 +1085,7 @@ class ClientSession:
             )
         )
 
-    if sys.version_info >= (3, 11) and TYPE_CHECKING:
+    if TYPE_CHECKING:
 
         @overload
         async def _ws_connect(
@@ -1229,6 +1192,10 @@ class ClientSession:
             )
 
         # send request
+        # Websocket handshakes keep going through the public request()
+        # wrapper; the private flag makes the egress redirect surface skip
+        # the upgrade while timeout_overlay, cookie_surface and
+        # connector_admit still apply.
         resp = await self.request(
             method,
             url,
@@ -1239,7 +1206,16 @@ class ClientSession:
             ssl=ssl,
             server_hostname=server_hostname,
             proxy_headers=proxy_headers,
-        )
+            _egress_ignore_redirect_surface=True,
+        )  # type: ignore[call-arg]
+
+        # A reject_acquire frame pushed while the borrow/handshake was
+        # already in flight must be rejected, not silently served.
+        if egress.acquire_is_rejected():
+            resp.close()
+            raise EgressAcquireDenied(
+                "connector_admit=reject_acquire forbids the websocket borrow"
+            )
 
         try:
             # check handshake
@@ -1319,16 +1295,6 @@ class ClientSession:
             conn_proto = conn.protocol
             assert conn_proto is not None
 
-            # A successful WebSocket upgrade takes the connection out of
-            # the pool: any connection-pin scope covering this request is
-            # exhausted, its later requests fail instead of redialing.
-            assert self._connector is not None
-            self._connector._exhaust_pin_proto(
-                conn_proto,
-                "Pinned connection was upgraded to a WebSocket and taken "
-                "out of the connection pool",
-            )
-
             # For WS connection the read_timeout must be either ws_timeout.ws_receive or greater
             # None == no timeout, i.e. infinite timeout, so None is the max timeout possible
             if ws_timeout.ws_receive is None:
@@ -1404,7 +1370,7 @@ class ClientSession:
         except LookupError:
             return None
 
-    if sys.version_info >= (3, 11) and TYPE_CHECKING:
+    if TYPE_CHECKING:
 
         def get(
             self,
@@ -1509,34 +1475,6 @@ class ClientSession:
             return _RequestContextManager(
                 self._request(hdrs.METH_DELETE, url, **kwargs)
             )
-
-    def pin_connection(self) -> ConnectionPin:
-        """Open a scope that pins requests to one connection.
-
-        The first request made inside the scope pins the exact connection
-        it acquires; subsequent requests in the scope use the same
-        connection whenever they have the same connection key
-        (host, port, proxy and SSL settings). Requests with another
-        connection key still go through the regular pool, and the pinned
-        connection is never handed out for them.
-
-        Use as an asynchronous context manager::
-
-            async with session.pin_connection() as pin:
-                async with await session.get(url) as resp:
-                    await resp.read()
-                async with await session.get(url) as resp:
-                    # served by the very same TCP connection
-                    await resp.read()
-
-        Scopes can be nested; closing an inner scope leaves enclosing
-        scopes intact. If the pinned connection breaks or is taken over
-        (for example by a WebSocket upgrade), later matching requests in
-        the scope fail with
-        :class:`~aiohttp.ClientConnectionPinError` instead of opening a
-        replacement connection.
-        """
-        return ConnectionPin(self)
 
     async def close(self) -> None:
         """Close underlying connector.
@@ -1720,7 +1658,7 @@ class _SessionRequestContextManager:
         await self._session.close()
 
 
-if sys.version_info >= (3, 11) and TYPE_CHECKING:
+if TYPE_CHECKING:
 
     def request(
         method: str,

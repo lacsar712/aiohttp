@@ -263,16 +263,13 @@ The client session supports the context manager protocol for self closing.
       peer which can help prevent "connection reset" errors at the cost of
       additional cleanup time. This timeout is passed to the underlying
       :class:`TCPConnector` when one is created automatically.
-      Note: On Python versions prior to 3.11, only a value of ``0`` is supported;
-      other values will trigger a warning.
 
       .. versionadded:: 3.12.5
 
       .. versionchanged:: 3.12.11
          Changed default from ``0.1`` to ``0`` to abort SSL connections
          immediately when the connector is closed. Added support for
-         ``ssl_shutdown_timeout=0`` on all Python versions. A :exc:`RuntimeWarning`
-         is issued when non-zero values are passed on Python < 3.11.
+         ``ssl_shutdown_timeout=0`` on all Python versions.
 
       .. deprecated:: 3.12.11
          This parameter is deprecated and will be removed in aiohttp 4.0.
@@ -877,27 +874,6 @@ The client session supports the context manager protocol for self closing.
          .. versionadded:: 3.14
 
 
-   .. method:: pin_connection()
-
-      Open a connection-pin scope as an asynchronous context manager::
-
-          async with session.pin_connection() as pin:
-              ...
-
-      The first request in the scope pins the exact connection it
-      acquires, together with its connection key; subsequent requests
-      with the same key reuse that connection, waiting for it when it is
-      busy. Requests with another key and requests outside the scope
-      keep using the regular connection pool. If the pinned connection
-      cannot be reused anymore, later matching requests in the scope
-      raise :class:`aiohttp.ClientConnectionPinError`.
-
-      Returns a :class:`~aiohttp.ConnectionPin` instance, usable as an
-      asynchronous context manager. Scopes may be nested; concurrent
-      scopes are isolated.
-
-      .. versionadded:: 4.0
-
    .. method:: close()
       :async:
 
@@ -910,6 +886,148 @@ The client session supports the context manager protocol for self closing.
       Detach connector from session without closing the former.
 
       Session is switched to closed state anyway.
+
+
+
+Outbound egress profile stack
+-----------------------------
+
+The *egress profile stack* temporarily changes how outgoing client calls
+behave for the current :mod:`asyncio` task, without modifying the
+:class:`ClientSession`, connector or cookie jar and without adding
+constructor parameters.  Frames are pushed with
+:func:`egress_profile` and popped automatically when the ``with`` block
+exits, even on exceptions::
+
+    import aiohttp
+    from aiohttp import ClientTimeout, egress_profile, RedirectSurface
+
+    async with aiohttp.ClientSession() as session:
+        with egress_profile(redirect_surface=RedirectSurface.DENY_REDIRECT):
+            # Raises aiohttp.EgressRedirectDenied instead of following.
+            await session.get("http://example.com/redirect")
+
+The stack is task-local (backed by :class:`contextvars.ContextVar`):
+concurrent tasks never share frames, nested calls see the innermost frame,
+and an empty stack means the standard behavior is unchanged.  Frames never
+replace the session, connector or cookie jar -- every rule is applied to
+the objects the current call actually uses, including the module-level
+:func:`aiohttp.request` shortcut and websocket handshakes where applicable.
+
+Four independent dimensions are supported; they are enums and never
+collapse into a single boolean:
+
+* **redirect_surface** (:class:`RedirectSurface`)
+
+  - ``KEEP`` (default): follow redirects according to ``max_redirects``.
+  - ``DENY_REDIRECT``: raise :class:`EgressRedirectDenied` when a 3xx
+    response would be followed; the next hop is never sent.  Websocket
+    handshakes are not affected by this dimension.
+  - ``CAP_ONE``: follow at most one hop, raise
+    :class:`EgressRedirectCapExceeded` before the second hop.
+
+* **cookie_surface** (:class:`CookieSurface`)
+
+  - ``KEEP`` (default): responses update the cookie jar and requests send
+    matching jar cookies.
+  - ``FREEZE_JAR``: responses never add cookies to the jar, while existing
+    jar cookies are still sent outbound.
+  - ``OMIT_OUTBOUND``: requests never carry jar cookies, while responses
+    may still populate the jar.  Explicit per-request ``cookies=`` are not
+    suppressed.
+
+* **timeout_overlay** (:class:`TimeoutOverlay`)
+
+  - ``KEEP`` (default): the per-call ``timeout`` or the session default
+    :class:`ClientTimeout` applies.
+  - ``FAIL_FAST``: the frame's ``fail_fast_timeout``
+    :class:`ClientTimeout` clamps the effective deadlines per field
+    (``total``, ``connect``, ``sock_connect``, ``sock_read``); an expired
+    deadline still raises.
+  - ``FREEZE_BASE``: a shorter per-call ``timeout`` is ignored and the
+    session default baseline is used.  A cancelled task still fails.
+
+* **connector_admit** (:class:`ConnectorAdmit`)
+
+  - ``KEEP`` (default): connection borrowing and release are unchanged.
+  - ``REJECT_ACQUIRE``: borrowing a connection raises
+    :class:`EgressAcquireDenied` before any protocol connection is lent,
+    for both regular requests and :meth:`ClientSession.ws_connect`.  The
+    rule is observed by :class:`TCPConnector`, :class:`UnixConnector` and
+    :class:`NamedPipeConnector`.
+  - ``FORCE_DETACH``: connections borrowed by the frame are closed when
+    released and can never be pooled for reuse.
+
+The decision points re-read the stack at every hop, borrow and release, so
+a frame pushed after the first request bytes, while queued for a
+connection or between redirect hops is honored or rejected rather than
+silently ignored.
+
+.. function:: egress_profile(*, redirect_surface=RedirectSurface.KEEP, cookie_surface=CookieSurface.KEEP, timeout_overlay=TimeoutOverlay.KEEP, connector_admit=ConnectorAdmit.KEEP, fail_fast_timeout=None)
+
+   Context manager that pushes an :class:`EgressProfile` frame for the
+   current task and pops it on exit.  ``fail_fast_timeout`` is required
+   when ``timeout_overlay=TimeoutOverlay.FAIL_FAST``.
+
+.. class:: EgressProfile(*, redirect_surface=RedirectSurface.KEEP, cookie_surface=CookieSurface.KEEP, timeout_overlay=TimeoutOverlay.KEEP, connector_admit=ConnectorAdmit.KEEP, fail_fast_timeout=None)
+
+   Immutable stack frame.  Instances can also be pushed manually with
+   :func:`push_egress_profile` and :func:`pop_egress_profile`.
+
+.. class:: RedirectSurface
+
+   Enum: ``KEEP``, ``DENY_REDIRECT``, ``CAP_ONE``.
+
+.. class:: CookieSurface
+
+   Enum: ``KEEP``, ``FREEZE_JAR``, ``OMIT_OUTBOUND``.
+
+.. class:: TimeoutOverlay
+
+   Enum: ``KEEP``, ``FAIL_FAST``, ``FREEZE_BASE``.
+
+.. class:: ConnectorAdmit
+
+   Enum: ``KEEP``, ``REJECT_ACQUIRE``, ``FORCE_DETACH``.
+
+.. function:: current_egress_view()
+
+   Return a read-only :class:`EgressView` snapshot of the current task's
+   stack top (an empty stack is equivalent to all-``KEEP``).
+
+.. class:: EgressView
+
+   Read-only snapshot with the ``redirect_surface``, ``cookie_surface``,
+   ``timeout_overlay`` and ``connector_admit`` members, the stack
+   ``depth``, the active ``profile`` and merged helpers such as
+   :meth:`effective_max_redirects` and :meth:`resolve_timeout`.
+
+.. function:: effective_egress(session, *, max_redirects=10)
+
+   Return a read-only :class:`EffectiveEgress` view merged with the live
+   session defaults (``timeout``, ``raise_for_status``) and its current
+   connector and cookie jar; none of them are copied or replaced.
+
+.. function:: push_egress_profile(profile)
+
+   Push a frame and return a token.
+
+.. function:: pop_egress_profile(token, profile)
+
+   Pop the frame; raise ``RuntimeError`` if it is not the current stack
+   top.
+
+.. exception:: EgressRedirectDenied
+
+   Raised when ``DENY_REDIRECT`` forbids following a redirect.
+
+.. exception:: EgressRedirectCapExceeded
+
+   Raised when ``CAP_ONE`` forbids following more than one redirect.
+
+.. exception:: EgressAcquireDenied
+
+   Raised when ``REJECT_ACQUIRE`` forbids borrowing a connection.
 
 
 
@@ -1391,16 +1509,14 @@ is controlled by *force_close* constructor's parameter).
       behavior. Setting this to a positive value (e.g., ``0.1``) will perform
       a graceful shutdown when closing the connector, notifying the remote
       server which can help prevent "connection reset" errors at the cost of
-      additional cleanup time. Note: On Python versions prior to 3.11, only
-      a value of ``0`` is supported; other values will trigger a warning.
+      additional cleanup time.
 
         .. versionadded:: 3.12.5
 
         .. versionchanged:: 3.12.11
            Changed default from ``0.1`` to ``0`` to abort SSL connections
            immediately when the connector is closed. Added support for
-           ``ssl_shutdown_timeout=0`` on all Python versions. A :exc:`RuntimeWarning`
-           is issued when non-zero values are passed on Python < 3.11.
+           ``ssl_shutdown_timeout=0`` on all Python versions.
 
         .. deprecated:: 3.12.11
            This parameter is deprecated and will be removed in aiohttp 4.0.
@@ -2458,35 +2574,6 @@ Utilities
    .. versionadded:: 3.14.4
 
 
-.. class:: ConnectionPin()
-   :canonical: aiohttp.client.ConnectionPin
-
-   An open connection-pin scope returned by
-   :py:meth:`ClientSession.pin_connection`. Instances are asynchronous
-   context managers and must not be instantiated directly.
-
-   See :ref:`aiohttp-client-pin-connection` for a full description of
-   the semantics.
-
-   .. attribute:: key
-
-      The :class:`aiohttp.ClientRequest` connection key the scope is
-      pinned to, or ``None`` until the first request of the scope has
-      acquired a connection. The key identifies host, port, proxy and
-      SSL settings.
-
-      A read-only property.
-
-   .. attribute:: bound
-
-      ``True`` once the opening request has pinned a connection,
-      ``False`` while the scope is still unbound.
-
-      A read-only property.
-
-   .. versionadded:: 4.0
-
-
 .. class:: DigestAuthMiddleware(login, password, *, preemptive=True)
    :canonical: aiohttp.client_middleware_digest_auth.DigestAuthMiddleware
 
@@ -3033,16 +3120,6 @@ Connection errors
 
    Derived from :exc:`ClientError`
 
-.. class:: ClientConnectionPinError
-   :canonical: aiohttp.client_exceptions.ClientConnectionPinError
-
-   The connection pinned by a :py:meth:`ClientSession.pin_connection`
-   scope is no longer usable (it was closed or taken over, for example
-   by a WebSocket upgrade). A new connection is never established to
-   replace a pinned one.
-
-   Derived from :exc:`ClientConnectionError`
-
 .. class:: ClientConnectionResetError
    :canonical: aiohttp.client_exceptions.ClientConnectionResetError
 
@@ -3159,8 +3236,6 @@ Hierarchy of exceptions
 * :exc:`ClientError`
 
   * :exc:`ClientConnectionError`
-
-    * :exc:`ClientConnectionPinError`
 
     * :exc:`ClientConnectionResetError`
 

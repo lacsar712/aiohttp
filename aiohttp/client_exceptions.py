@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
 from .typedefs import StrOrURL
 
@@ -22,7 +22,6 @@ else:
 __all__ = (
     "ClientError",
     "ClientConnectionError",
-    "ClientConnectionPinError",
     "ClientConnectionResetError",
     "ClientOSError",
     "ClientConnectorError",
@@ -49,6 +48,10 @@ __all__ = (
     "NonHttpUrlClientError",
     "InvalidUrlRedirectClientError",
     "NonHttpUrlRedirectClientError",
+    "ClientEgressError",
+    "EgressRedirectDenied",
+    "EgressRedirectCapExceeded",
+    "EgressAcquireDenied",
     "WSMessageTypeError",
 )
 
@@ -127,17 +130,6 @@ class ClientConnectionError(ClientError):
     """Base class for client socket errors."""
 
 
-class ClientConnectionPinError(ClientConnectionError):
-    """Connection pinned by a connection-pin scope is no longer usable.
-
-    Raised when a request issued inside a :class:`aiohttp.ClientSession`
-    connection-pin scope needs the pinned connection but that connection
-    has been closed, was removed from the pool (for example by a WebSocket
-    upgrade) or the connector was closed. A new connection is never
-    established to replace a pinned one.
-    """
-
-
 class ClientConnectionResetError(ClientConnectionError, ConnectionResetError):
     """ConnectionResetError"""
 
@@ -174,7 +166,7 @@ class ClientConnectorError(ClientOSError):
         return self._conn_key.port
 
     @property
-    def ssl(self) -> Union[SSLContext, bool, "Fingerprint"]:
+    def ssl(self) -> "SSLContext | bool | Fingerprint":
         return self._conn_key.ssl
 
     def __str__(self) -> str:
@@ -335,6 +327,39 @@ class InvalidUrlRedirectClientError(InvalidUrlClientError, RedirectClientError):
 
 class NonHttpUrlRedirectClientError(NonHttpUrlClientError, RedirectClientError):
     """Non http URL redirect client error."""
+
+
+class ClientEgressError(ClientError):
+    """Base class for outbound egress profile violations.
+
+    Raised when the task-local outbound egress profile stack denies an
+    operation that would otherwise be allowed (following a redirect,
+    borrowing a connector connection).
+    """
+
+
+class EgressRedirectDenied(ClientEgressError):
+    """A redirect had to be followed but the egress profile denied it.
+
+    Corresponds to ``RedirectSurface.DENY_REDIRECT``: the next hop is
+    never sent.
+    """
+
+
+class EgressRedirectCapExceeded(ClientEgressError):
+    """More than one redirect hop had to be followed.
+
+    Corresponds to ``RedirectSurface.CAP_ONE``: at most one hop is
+    followed, the second hop is never sent.
+    """
+
+
+class EgressAcquireDenied(ClientEgressError):
+    """Borrowing a connector connection was denied.
+
+    Corresponds to ``ConnectorAdmit.REJECT_ACQUIRE``: no protocol
+    connection is lent to the frame.
+    """
 
 
 class ClientSSLError(ClientConnectorError):

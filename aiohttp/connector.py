@@ -19,11 +19,10 @@ import aiohappyeyeballs
 from aiohappyeyeballs import AddrInfoType, SocketFactoryType
 from multidict import CIMultiDict
 
-from . import hdrs, helpers
+from . import egress, hdrs, helpers
 from .abc import AbstractResolver, ResolveResult
 from .client_exceptions import (
     ClientConnectionError,
-    ClientConnectionPinError,
     ClientConnectorCertificateError,
     ClientConnectorDNSError,
     ClientConnectorError,
@@ -119,21 +118,13 @@ async def create_connection(
             ssl_shutdown_timeout=ssl_shutdown_timeout,
         )
     else:
-        if sys.version_info >= (3, 11):  # type: ignore[unreachable]
-            return await loop.create_connection(
-                protocol_factory,
-                ssl=ssl,
-                sock=sock,
-                server_hostname=server_hostname,
-                ssl_shutdown_timeout=ssl_shutdown_timeout,
-            )
-        else:
-            return await loop.create_connection(
-                protocol_factory,
-                ssl=ssl,
-                sock=sock,
-                server_hostname=server_hostname,
-            )
+        return await loop.create_connection(  # type: ignore[unreachable]
+            protocol_factory,
+            ssl=ssl,
+            sock=sock,
+            server_hostname=server_hostname,
+            ssl_shutdown_timeout=ssl_shutdown_timeout,
+        )
 
 
 async def start_tls(
@@ -157,23 +148,14 @@ async def start_tls(
             ssl_shutdown_timeout=ssl_shutdown_timeout,
         )
     else:
-        if sys.version_info >= (3, 11):  # type: ignore[unreachable]
-            return await loop.start_tls(
-                transport,
-                protocol,
-                sslcontext,
-                server_hostname=server_hostname,
-                ssl_handshake_timeout=ssl_handshake_timeout,
-                ssl_shutdown_timeout=ssl_shutdown_timeout,
-            )
-        else:
-            return await loop.start_tls(
-                transport,
-                protocol,
-                sslcontext,
-                server_hostname=server_hostname,
-                ssl_handshake_timeout=ssl_handshake_timeout,
-            )
+        return await loop.start_tls(  # type: ignore[unreachable]
+            transport,
+            protocol,
+            sslcontext,
+            server_hostname=server_hostname,
+            ssl_handshake_timeout=ssl_handshake_timeout,
+            ssl_shutdown_timeout=ssl_shutdown_timeout,
+        )
 
 
 class Connection:
@@ -186,6 +168,7 @@ class Connection:
         "_protocol",
         "_callbacks",
         "_source_traceback",
+        "_egress_force_detach",
     )
 
     def __init__(
@@ -203,6 +186,9 @@ class Connection:
         self._source_traceback = (
             traceback.extract_stack(sys._getframe(1)) if loop.get_debug() else None
         )
+        # Set when the connection was borrowed under a FORCE_DETACH egress
+        # frame: release() then closes the protocol instead of pooling it.
+        self._egress_force_detach = False
 
     def __repr__(self) -> str:
         return f"Connection<{self._key}>"
@@ -258,7 +244,13 @@ class Connection:
         self._notify_release()
 
         if self._protocol is not None:
-            self._connector._release(self._key, self._protocol)
+            # Detach when the borrow was tainted at acquire time or when a
+            # FORCE_DETACH frame governs the release right now. Keep the
+            # default call signature untouched on the empty-stack path.
+            if self._egress_force_detach or egress.force_detach_active():
+                self._connector._release(self._key, self._protocol, should_close=True)
+            else:
+                self._connector._release(self._key, self._protocol)
             self._protocol = None
 
     @property
@@ -301,104 +293,6 @@ class _TransportPlaceholder:
 
     def abort(self) -> None:
         """Abort the placeholder (does nothing)."""
-
-
-class _ConnectionPin:
-    """Connector-side state of a ClientSession connection-pin scope.
-
-    A pin starts unbound: the first request made through the scope binds
-    it to the connection key and protocol of the connection that request
-    actually acquires. From then on, requests matching the key must be
-    served by ``proto``; the protocol is parked on the pin instead of the
-    regular pool whenever it is released.
-
-    Pins form a parent chain mirroring nested scopes: an unbound inner
-    pin whose enclosing pin already owns the requested key binds to the
-    enclosing pin's protocol instead of acquiring another connection.
-    """
-
-    __slots__ = (
-        "_loop",
-        "parent",
-        "key",
-        "proto",
-        "closed",
-        "invalid",
-        "_exc",
-        "_wake_fut",
-    )
-
-    def __init__(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        parent: "_ConnectionPin | None",
-    ) -> None:
-        self._loop = loop
-        self.parent = parent
-        self.key: "ConnectionKey | None" = None
-        self.proto: ResponseHandler | None = None
-        # Set by unpin() when the scope is exited; never acquires or binds.
-        self.closed = False
-        # Set once the pinned connection can no longer be used. A failed
-        # pin is never repaired by establishing a new connection.
-        self.invalid = False
-        self._exc: BaseException | None = None
-        # Completed whenever something changes that a queued request may be
-        # waiting for: the protocol was parked idle, the pin failed, or the
-        # scope exited.
-        self._wake_fut: asyncio.Future[None] = loop.create_future()
-
-    def enclosing(self, key: "ConnectionKey") -> "_ConnectionPin | None":
-        """Return the nearest still-live enclosing pin bound to ``key``."""
-        pin = self.parent
-        while pin is not None:
-            if pin.key == key and not pin.closed and not pin.invalid:
-                return pin
-            pin = pin.parent
-        return None
-
-    def waiter(self) -> asyncio.Future[None]:
-        """Return a future to await for the next state change."""
-        fut = self._wake_fut
-        if fut.done():
-            fut = self._wake_fut = self._loop.create_future()
-        return fut
-
-    def wake(self) -> None:
-        if not self._wake_fut.done():
-            self._wake_fut.set_result(None)
-
-    def fail(self, exc: BaseException) -> None:
-        """Mark the pin invalid and wake every queued request."""
-        self.invalid = True
-        if self._exc is None:
-            self._exc = exc
-        self.wake()
-
-    def cancel(self) -> None:
-        """Wake queued requests when the connector is closing.
-
-        A done wake future cannot be cancelled, so queued requests are
-        woken normally and discover the closed connector themselves.
-        """
-        self.closed = True
-        self.wake()
-
-    def __repr__(self) -> str:
-        state = "unbound" if self.key is None else f"key={self.key}"
-        if self.invalid:
-            state += ", invalid"
-        if self.closed:
-            state += ", closed"
-        return f"<_ConnectionPin({state})>"
-
-
-def _pinned_connection_closed_error(key: "ConnectionKey") -> ClientConnectionPinError:
-    return ClientConnectionPinError(
-        f"Cannot reuse the pinned connection for {key}: "
-        "the connection was closed; a pinned connection is never replaced "
-        "with a newly established one"
-    )
 
 
 class BaseConnector:
@@ -477,17 +371,6 @@ class BaseConnector:
         self._waiters: defaultdict[
             ConnectionKey, OrderedDict[asyncio.Future[None], None]
         ] = defaultdict(OrderedDict)
-
-        # Connection pins created by ClientSession.pin_connection() scopes.
-        # All currently open (including invalidated-but-not-yet-exited) pins.
-        self._pins: set[_ConnectionPin] = set()
-        # A protocol kept by a pin never enters ``_conns``. Each pinned
-        # protocol maps to the pins referencing it (outer scopes first);
-        # nested scopes pin the very same protocol.
-        self._proto_pins: dict[ResponseHandler, list[_ConnectionPin]] = {}
-        # Protocols released while still pinned, parked for the pin's next
-        # request instead of being returned to the regular pool.
-        self._pinned_idle: dict[ResponseHandler, asyncio.Future[None]] = {}
 
         self._loop = loop
         self._factory = functools.partial(ResponseHandler, loop=loop)
@@ -683,20 +566,6 @@ class BaseConnector:
                     if closed := proto.closed:
                         waiters.append(closed)
 
-            # Idle connections parked by open connection-pin scopes are not
-            # in ``_conns`` or ``_acquired``; close them explicitly.
-            for proto in self._pinned_idle:
-                if (
-                    abort_ssl
-                    and proto.transport
-                    and proto.transport.get_extra_info("sslcontext") is not None
-                ):
-                    proto.abort()
-                else:
-                    proto.close()
-                if closed := proto.closed:
-                    waiters.append(closed)
-
             for proto in self._acquired:
                 if (
                     abort_ssl
@@ -723,15 +592,6 @@ class BaseConnector:
                 for keyed_waiter in keyed_waiters:
                     keyed_waiter.cancel()
             self._waiters.clear()
-            # Fail and interrupt all connection-pin scopes; their queued
-            # requests are cancelled the same way pool-slot waiters are.
-            closed_error = ClientConnectionError("Connector is closed.")
-            for pin in self._pins:
-                pin.fail(closed_error)
-                pin.cancel()
-            self._pins.clear()
-            self._proto_pins.clear()
-            self._pinned_idle.clear()
             self._cleanup_handle = None
             self._cleanup_closed_transports.clear()
             self._cleanup_closed_handle = None
@@ -793,225 +653,31 @@ class BaseConnector:
                 req.headers[hdrs.PROXY_AUTHORIZATION] = proxy_auth
         return proxy_req
 
-    def create_pin(self, parent: _ConnectionPin | None = None) -> _ConnectionPin:
-        """Create an unbound connection pin for a ClientSession pin scope."""
-        return _ConnectionPin(self._loop, parent)
-
-    def _bind_pin(
-        self, pin: _ConnectionPin, key: "ConnectionKey", proto: ResponseHandler
-    ) -> None:
-        """Bind an unbound pin to the connection its opening request got."""
-        assert pin.key is None and pin.proto is None
-        first = proto not in self._proto_pins
-        self._proto_pins.setdefault(proto, []).append(pin)
-        pin.key = key
-        pin.proto = proto
-        self._pins.add(pin)
-        if first:
-            # Wake queued pinned requests as soon as the peer goes away,
-            # even while the connection is merely parked idle.
-            closed_fut = proto.closed
-            if closed_fut is None:
-                # connection_lost() already ran before we could subscribe
-                self._pinned_proto_closed(proto, None)
-            else:
-                closed_fut.add_done_callback(
-                    functools.partial(self._pinned_proto_closed, proto)
-                )
-
-    def _pinned_proto_closed(
-        self,
-        proto: ResponseHandler,
-        closed_fut: "asyncio.Future[None] | None",
-    ) -> None:
-        """Invalidate pins referencing a protocol whose transport was lost."""
-        if proto not in self._proto_pins:
-            return
-        cause: BaseException | None = None
-        if closed_fut is not None and not closed_fut.cancelled():
-            cause = closed_fut.exception()
-        pins = self._proto_pins.get(proto)
-        key = pins[0].key if pins else None
-        if key is not None:
-            exc = _pinned_connection_closed_error(key)
-        else:
-            exc = ClientConnectionPinError("Pinned connection was closed")
-        if cause is not None:
-            exc.__cause__ = cause
-        self._invalidate_pin_proto(proto, exc)
-
-    def _invalidate_pin_proto(self, proto: ResponseHandler, exc: BaseException) -> None:
-        """Fail every pin referencing ``proto`` without closing it."""
-        pins = self._proto_pins.pop(proto, None)
-        self._pinned_idle.pop(proto, None)
-        if not pins:
-            return
-        for pin in pins:
-            self._pins.discard(pin)
-            pin.fail(exc)
-
-    def _exhaust_pin_proto(self, proto: ResponseHandler, message: str) -> None:
-        """Invalidate pins after ``proto`` left the pool (e.g. WS upgrade)."""
-        if proto in self._proto_pins:
-            self._invalidate_pin_proto(proto, ClientConnectionPinError(message))
-
-    def unpin(self, pin: _ConnectionPin) -> None:
-        """Close a pin scope without affecting enclosing scopes."""
-        pin.closed = True
-        pin.wake()
-        self._pins.discard(pin)
-        proto = pin.proto
-        if proto is None:
-            return
-        pins = self._proto_pins.get(proto)
-        if pins is None or pin not in pins:
-            return
-        pins.remove(pin)
-        if pins:
-            # An enclosing scope still owns the very same connection; it
-            # stays parked for that scope.
-            pins[0].wake()
-            return
-        self._proto_pins.pop(proto, None)
-        if self._pinned_idle.pop(proto, None) is None:
-            # The protocol is acquired by an in-flight response (or the
-            # connector is gone); its release now follows the regular path.
-            return
-        if self._closed:
-            return
-        key = pin.key
-        assert key is not None
-        # Last scope exited while the connection sat idle: hand it back to
-        # the regular pool, applying the same keepalive/close rules as any
-        # other released connection.
-        if proto.is_connected() and not (self._force_close or proto.should_close):
-            self._conns[key].append((proto, monotonic()))
-            if self._cleanup_handle is None:
-                self._cleanup_handle = helpers.weakref_handle(
-                    self,
-                    "_cleanup",
-                    self._keepalive_timeout,
-                    self._loop,
-                    timeout_ceil_threshold=self._timeout_ceil_threshold,
-                )
-        else:
-            transport = proto.transport
-            proto.close()
-            if key.is_ssl and not self._cleanup_closed_disabled:
-                self._cleanup_closed_transports.append(transport)
-
     async def connect(
-        self,
-        req: ClientRequest,
-        traces: list["Trace"],
-        timeout: "ClientTimeout",
-        *,
-        pin: _ConnectionPin | None = None,
+        self, req: ClientRequest, traces: list["Trace"], timeout: "ClientTimeout"
     ) -> Connection:
-        """Get from pool or create new connection.
-
-        When ``pin`` is given the request participates in a connection-pin
-        scope: an already bound pin forces reuse of its exact protocol for
-        the matching key, an unbound pin binds to the connection acquired
-        for this request, and other keys use the regular pool unchanged.
-        """
+        """Get from pool or create new connection."""
+        # Egress admission is re-read from the task stack at every lend
+        # point below (pool hit, after the limit-slot wait, and right
+        # before creating a new protocol), never snapshotted once.
+        egress.guard_connection_acquire()
         key = req.connection_key
-        if pin is not None and not pin.closed:
-            if pin.key is not None:
-                if pin.key == key:
-                    if req.proxy:
-                        self._update_proxy_auth_header_and_build_proxy_req(req)
-                    return await self._connect_pinned(pin, key, traces, timeout)
-            elif (ancestor := pin.enclosing(key)) is not None:
-                if req.proxy:
-                    self._update_proxy_auth_header_and_build_proxy_req(req)
-                conn = await self._connect_pinned(ancestor, key, traces, timeout)
-                proto = conn.protocol
-                assert proto is not None
-                self._bind_pin(pin, key, proto)
-                return conn
-
-        conn = await self._connect_default(key, req, traces, timeout)
-
-        if pin is not None and not pin.closed and pin.key is None:
-            proto = conn.protocol
-            assert proto is not None
-            self._bind_pin(pin, key, proto)
-        return conn
-
-    async def _connect_pinned(
-        self,
-        pin: _ConnectionPin,
-        key: "ConnectionKey",
-        traces: list["Trace"],
-        timeout: "ClientTimeout",
-    ) -> Connection:
-        """Acquire the exact protocol owned by ``pin``, waiting if busy."""
-        async with ceil_timeout(timeout.connect, timeout.ceil_threshold):
-            while True:
-                if pin.invalid:
-                    assert pin._exc is not None
-                    raise pin._exc
-                if pin.closed or self._closed:
-                    raise ClientConnectionError("Connector is closed.")
-                proto = pin.proto
-                assert proto is not None
-
-                idle_fut = self._pinned_idle.get(proto)
-                if idle_fut is not None and idle_fut.done():
-                    if not proto.is_connected():
-                        self._invalidate_pin_proto(
-                            proto, _pinned_connection_closed_error(key)
-                        )
-                        continue
-                    # The pinned protocol is parked and free: reclaim it.
-                    self._pinned_idle.pop(proto, None)
-                    self._acquired.add(proto)
-                    if self._limit_per_host:
-                        self._acquired_per_host[key].add(proto)
-                    if traces:
-                        for trace in traces:
-                            try:
-                                await trace.send_connection_reuseconn()
-                            except BaseException:
-                                self._release_acquired(key, proto)
-                                raise
-                    return Connection(self, key, proto, self._loop)
-
-                # The pinned protocol is held by another in-flight request
-                # of this pin; wait for it without opening a second one.
-                # Limits are not consumed by this wait, so cancellation or
-                # timeout has no slot to restore.
-                if traces:
-                    for trace in traces:
-                        await trace.send_connection_queued_start()
-                await pin.waiter()
-                if traces:
-                    for trace in traces:
-                        await trace.send_connection_queued_end()
-
-    async def _connect_default(
-        self,
-        key: "ConnectionKey",
-        req: ClientRequest,
-        traces: list["Trace"],
-        timeout: "ClientTimeout",
-    ) -> Connection:
-        """Get a connection from the pool or create a new one."""
         if (conn := await self._get(key, traces)) is not None:
             # If we do not have to wait and we can get a connection from the pool
             # we can avoid the timeout ceil logic and directly return the connection
             if req.proxy:
                 self._update_proxy_auth_header_and_build_proxy_req(req)
-            return conn
+            return self._egress_mark_connection(conn)
 
         async with ceil_timeout(timeout.connect, timeout.ceil_threshold):
             if self._available_connections(key) <= 0:
                 await self._wait_for_available_connection(key, traces)
+                # A frame pushed while waiting for a slot must be honored.
+                egress.guard_connection_acquire()
                 if (conn := await self._get(key, traces)) is not None:
                     if req.proxy:
                         self._update_proxy_auth_header_and_build_proxy_req(req)
-                    return conn
+                    return self._egress_mark_connection(conn)
 
             placeholder = cast(
                 ResponseHandler, _TransportPlaceholder(self._placeholder_future)
@@ -1027,6 +693,7 @@ class BaseConnector:
                 if traces:
                     for trace in traces:
                         await trace.send_connection_create_start()
+                egress.guard_connection_acquire()
                 proto = await self._create_connection(req, traces, timeout)
                 if traces:
                     for trace in traces:
@@ -1050,7 +717,13 @@ class BaseConnector:
             acquired_per_host = self._acquired_per_host[key]
             acquired_per_host.remove(placeholder)
             acquired_per_host.add(proto)
-        return Connection(self, key, proto, self._loop)
+        return self._egress_mark_connection(Connection(self, key, proto, self._loop))
+
+    def _egress_mark_connection(self, conn: Connection) -> Connection:
+        """Taint a borrowed connection per the current egress frame."""
+        if egress.force_detach_active():
+            conn._egress_force_detach = True
+        return conn
 
     async def _wait_for_available_connection(
         self, key: "ConnectionKey", traces: list["Trace"]
@@ -1190,11 +863,6 @@ class BaseConnector:
 
         self._release_acquired(key, protocol)
 
-        pins = self._proto_pins.get(protocol)
-        if pins is not None:
-            self._release_pinned_protocol(key, protocol, pins, should_close)
-            return
-
         if self._force_close or should_close or protocol.should_close:
             transport = protocol.transport
             protocol.close()
@@ -1212,47 +880,6 @@ class BaseConnector:
                 self._loop,
                 timeout_ceil_threshold=self._timeout_ceil_threshold,
             )
-
-    def _release_pinned_protocol(
-        self,
-        key: "ConnectionKey",
-        protocol: ResponseHandler,
-        pins: list[_ConnectionPin],
-        should_close: bool,
-    ) -> None:
-        """Release a protocol kept by one or more open pin scopes.
-
-        Reusable protocols are parked on the pins, never returned to the
-        shared pool, so neither unpinned requests nor other scopes can
-        take them. Unreusable protocols invalidate the pins instead.
-        """
-        if self._force_close or should_close or protocol.should_close:
-            transport = protocol.transport
-            protocol.close()
-            if key.is_ssl and not self._cleanup_closed_disabled:
-                self._cleanup_closed_transports.append(transport)
-            if self._force_close:
-                reason = "the connector does not allow connection reuse"
-            else:
-                reason = "the connection was marked for closure"
-            self._invalidate_pin_proto(
-                protocol,
-                ClientConnectionPinError(
-                    f"Cannot reuse the pinned connection for {key}: {reason}; "
-                    "a pinned connection is never replaced with a newly "
-                    "established one"
-                ),
-            )
-            return
-
-        fut = self._pinned_idle.get(protocol)
-        if fut is None:
-            fut = self._loop.create_future()
-            self._pinned_idle[protocol] = fut
-        if not fut.done():
-            fut.set_result(None)
-        for pin in pins:
-            pin.wake()
 
     async def _create_connection(
         self, req: ClientRequest, traces: list["Trace"], timeout: "ClientTimeout"
@@ -1379,7 +1006,6 @@ class TCPConnector(BaseConnector):
                            This parameter allowed for a clean SSL shutdown by
                            notifying the remote peer of connection closure,
                            while avoiding excessive delays during connector cleanup.
-                           Note: Only takes effect on Python 3.11+.
     """
 
     allowed_protocol_schema_set = HIGH_LEVEL_SCHEMA_SET | frozenset({"tcp"})
@@ -1455,7 +1081,6 @@ class TCPConnector(BaseConnector):
         self._socket_factory = socket_factory
         self._ssl_shutdown_timeout: float | None
 
-        # Handle ssl_shutdown_timeout with warning for Python < 3.11
         if ssl_shutdown_timeout is sentinel:
             self._ssl_shutdown_timeout = 0
         else:
@@ -1465,17 +1090,6 @@ class TCPConnector(BaseConnector):
                 DeprecationWarning,
                 stacklevel=2,
             )
-            if (
-                sys.version_info < (3, 11)
-                and ssl_shutdown_timeout is not None
-                and ssl_shutdown_timeout != 0
-            ):
-                warnings.warn(
-                    f"ssl_shutdown_timeout={ssl_shutdown_timeout} is ignored on Python < 3.11; "
-                    "only ssl_shutdown_timeout=0 is supported. The timeout will be ignored.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
             self._ssl_shutdown_timeout = ssl_shutdown_timeout
 
     async def close(self, *, abort_ssl: bool = False) -> None:
@@ -1676,6 +1290,7 @@ class TCPConnector(BaseConnector):
 
         Has same keyword arguments as BaseEventLoop.create_connection.
         """
+        egress.guard_connection_acquire()
         if req.proxy:
             _, proto = await self._create_proxy_connection(req, traces, timeout)
         else:
@@ -1746,12 +1361,7 @@ class TCPConnector(BaseConnector):
                     loop=self._loop,
                     socket_factory=self._socket_factory,
                 )
-                # Add ssl_shutdown_timeout for Python 3.11+ when SSL is used
-                if (
-                    kwargs.get("ssl")
-                    and self._ssl_shutdown_timeout
-                    and sys.version_info >= (3, 11)
-                ):
+                if kwargs.get("ssl") and self._ssl_shutdown_timeout:
                     kwargs["ssl_shutdown_timeout"] = self._ssl_shutdown_timeout
                 return await create_connection(self._loop, *args, **kwargs, sock=sock)
         except cert_errors as exc:
@@ -1762,59 +1372,6 @@ class TCPConnector(BaseConnector):
             if exc.errno is None and isinstance(exc, asyncio.TimeoutError):
                 raise
             raise client_error(req.connection_key, exc) from exc
-
-    def _warn_about_tls_in_tls(
-        self,
-        underlying_transport: asyncio.Transport,
-        req: ClientRequest,
-    ) -> None:
-        """Issue a warning if the requested URL has HTTPS scheme."""
-        if req.url.scheme != "https":
-            return
-
-        # TLS-in-TLS only applies when the proxy itself is HTTPS.
-        # When the proxy is HTTP, start_tls upgrades a plain TCP connection,
-        # which is standard TLS and works on all event loops and Python versions.
-        if req.proxy is None or req.proxy.scheme != "https":
-            return
-
-        # Check if uvloop is being used, which supports TLS in TLS,
-        # otherwise assume that asyncio's native transport is being used.
-        if type(underlying_transport).__module__.startswith("uvloop"):
-            return
-
-        # Check if aiofastnet is being used, which supports TLS in TLS
-        if aiofastnet is not None:
-            return
-
-        # Support in asyncio was added in Python 3.11 (bpo-44011)
-        asyncio_supports_tls_in_tls = sys.version_info >= (3, 11) or getattr(  # type: ignore[unreachable]
-            underlying_transport,
-            "_start_tls_compatible",
-            False,
-        )
-
-        if asyncio_supports_tls_in_tls:
-            return
-
-        warnings.warn(
-            "An HTTPS request is being sent through an HTTPS proxy. "
-            "This support for TLS in TLS is known to be disabled "
-            "in the stdlib asyncio. This is why you'll probably see "
-            "an error in the log below.\n\n"
-            "It is possible to enable it via monkeypatching. "
-            "For more details, see:\n"
-            "* https://bugs.python.org/issue37179\n"
-            "* https://github.com/python/cpython/pull/28073\n\n"
-            "You can temporarily patch this as follows:\n"
-            "* https://docs.aiohttp.org/en/stable/client_advanced.html#proxy-support\n"
-            "* https://github.com/aio-libs/aiohttp/discussions/6044\n",
-            RuntimeWarning,
-            source=self,
-            # Why `4`? At least 3 of the calls in the stack originate
-            # from the methods in this class.
-            stacklevel=3,
-        )
 
     async def _start_tls_connection(
         self,
@@ -1836,8 +1393,7 @@ class TCPConnector(BaseConnector):
                 timeout.sock_connect, ceil_threshold=timeout.ceil_threshold
             ):
                 try:
-                    # ssl_shutdown_timeout is only available in Python 3.11+
-                    if sys.version_info >= (3, 11) and self._ssl_shutdown_timeout:
+                    if self._ssl_shutdown_timeout:
                         tls_transport = await start_tls(
                             self._loop,
                             underlying_transport,
@@ -1976,7 +1532,7 @@ class TCPConnector(BaseConnector):
                     req=req,
                     client_error=client_error,
                 )
-            except (ClientConnectorError, asyncio.TimeoutError) as exc:
+            except (ClientConnectorError, TimeoutError) as exc:
                 last_exc = exc
                 aiohappyeyeballs.pop_addr_infos_interleave(addr_infos, self._interleave)
                 continue
@@ -2010,8 +1566,6 @@ class TCPConnector(BaseConnector):
         )
 
         if req.is_ssl():
-            self._warn_about_tls_in_tls(transport, req)
-
             # For HTTPS requests over HTTP proxy
             # we must notify proxy to tunnel connection
             # so we send CONNECT command:
@@ -2122,6 +1676,7 @@ class UnixConnector(BaseConnector):
     async def _create_connection(
         self, req: ClientRequest, traces: list["Trace"], timeout: "ClientTimeout"
     ) -> ResponseHandler:
+        egress.guard_connection_acquire()
         try:
             async with ceil_timeout(
                 timeout.sock_connect, ceil_threshold=timeout.ceil_threshold
@@ -2189,6 +1744,7 @@ class NamedPipeConnector(BaseConnector):
     async def _create_connection(
         self, req: ClientRequest, traces: list["Trace"], timeout: "ClientTimeout"
     ) -> ResponseHandler:
+        egress.guard_connection_acquire()
         try:
             async with ceil_timeout(
                 timeout.sock_connect, ceil_threshold=timeout.ceil_threshold
